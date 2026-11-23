@@ -31,6 +31,10 @@ solvers = Dict(
     "rl" => () -> richardson_lucy_iterative(measured, psf; regularizer=nothing, iterations=ITER),
     "admm_tv" => () -> first(deconvolution(measured, psf; regularizer=TV(num_dims=3), λ=0.01f0, background=bg_norm,
                                            opt=ADMM(iterations=50), padding=pad)),
+    # ADMM with the Hessian norm (TH), the other penalty the numpy admm takes; at λ 0.01 and 50 iterations
+    # the penalty hardly shows yet (0.998 like TV), at 0.1 it does
+    "admm_th" => () -> first(deconvolution(measured, psf; regularizer=TH(num_dims=3), λ=0.1f0, background=bg_norm,
+                                           opt=ADMM(iterations=50), padding=pad)),
     "lbfgs_tv" => () -> first(deconvolution(measured, psf; regularizer=TV(num_dims=3), λ=0.01f0, background=bg_norm,
                                             iterations=20, padding=pad)),
     # the setting shown in the result figure: a TV weight that suits the sparse test object

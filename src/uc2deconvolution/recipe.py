@@ -6,12 +6,16 @@ image) and in benchmark/benchmark.py.
 
     out = deconvolve(stack, Optics(pixel_um=0.12, z_step_um=0.5, na=0.75), Parameters())
 
-Two solvers. ``rl`` is Richardson-Lucy. ``map`` ports DeconvOptim.jl's map_cj_lean (branch
+Four solvers. ``rl`` is Richardson-Lucy. ``map`` ports DeconvOptim.jl's map_cj_lean (branch
 new_methods, src/map_cj_lean.jl, MIT licence): a data term (Poisson deviance, Anscombe or Gauss)
 plus a penalty (Good's roughness or the Frobenius norm of the Hessian), object = x**2,
 Fletcher-Reeves conjugate gradients, one Newton step per iteration with Armijo backtracking, three
-FFT convolutions per iteration. tests/test_recipe.py checks it against stored DeconvOptim.jl
-output.
+FFT convolutions per iteration. ``lbfgs`` ports DeconvOptim's default deconvolution()
+(src/deconvolution.jl, generic_invert.jl): data normalised to mean 1, object = x**2, Optim's
+L-BFGS with a backtracking line search; ``admm`` ports src/admm.jl: x >= 0 by projection, no
+derivatives. Both take the Poisson loss and total variation (src/regularizer.jl's TV), lbfgs also
+Good's roughness, both the Hessian norm. test_deconvolution.py checks them against stored
+DeconvOptim.jl output.
 
 Arrays are (z, y, x) float32 and a PSF is centred at index (0, 0, 0). ``padding`` is one fraction
 per axis, as in DeconvOptim.jl: the grid grows by that fraction and the border is left unconstrained
@@ -38,16 +42,23 @@ NAME, VERSION = "deconvolution", "1"
 WORKERS = os.cpu_count() or 4        # FFT threads
 EPS = np.float32(1e-7)
 PADDING = (0.25, 0, 0)               # z only: light from planes outside the stack
-METHODS = ("map", "rl")
+METHODS = ("map", "rl", "lbfgs", "admm")
 LOSSES = ("poisson", "anscombe", "gauss")
-PENALTIES = ("good", "hessian")
+PENALTIES = ("good", "hessian", "tv")
+# what each method takes (rl ignores both). lbfgs and admm normalise the data to mean 1 as
+# DeconvOptim does; with the Poisson loss that leaves the weight of the penalty unchanged
+SUPPORTED = {"map": (LOSSES, ("good", "hessian")), "rl": (LOSSES, PENALTIES),
+             "lbfgs": (("poisson",), ("tv", "good", "hessian")),
+             "admm": (("poisson",), ("tv", "hessian"))}
 ANSCOMBE = np.float32(3 / 8)          # offset of the Anscombe transform, in counts
 MODALITIES = ("widefield", "lightsheet")
 PSF_MODELS = ("scalar", "vectorial", "gaussian", "measured")
 LIMITS = {"iterations": (1, 500), "regularization": (0.0, 10.0), "tile": (64, 16384)}
 # peak memory of deconvolve() per voxel of a padded tile (tracemalloc, 2026-11-23; the same for
-# every shape tried) times 1.25 for the FFT's own buffers: 32, 61 and 100 bytes measured
-TILE_BYTES = {"rl": 40, "map": 75, "hessian": 125}
+# every shape tried) times 1.25 for the FFT's own buffers. Measured: rl 32, map 61 (with the
+# Hessian 100), lbfgs 142 (167; 80 of it the 10 steps L-BFGS keeps), admm 81 (105) bytes
+TILE_BYTES = {"rl": 40, "map": 75, "map_hessian": 125, "lbfgs": 180, "lbfgs_hessian": 210,
+              "admm": 100, "admm_hessian": 130}
 
 
 class Cancelled(Exception):
@@ -96,12 +107,17 @@ class Optics:
 
 @dataclass
 class Parameters:
-    method: str = "map"                   # "map" (regularised) or "rl" (Richardson-Lucy, fast)
+    method: str = "map"                   # "map", "lbfgs", "admm" (regularised) or "rl"
+                                          # (Richardson-Lucy, fast)
     iterations: int = 30
-    regularization: float = 1e-4          # weight of the penalty in measured counts; map only
-    loss: str = "poisson"                 # map: "poisson", "anscombe" or "gauss" (the noise model)
-    penalty: str = "good"                 # map: "good" (Good's roughness) or "hessian" (Frobenius
-                                          # norm of the Hessian: keeps edges and fine lines)
+    regularization: float = 1e-4          # weight of the penalty in measured counts. lbfgs and
+                                          # admm: DeconvOptim's lambda, the same weight (the
+                                          # Poisson loss and the penalties scale with the counts)
+    loss: str = "poisson"                 # map: "poisson", "anscombe" or "gauss" (the noise
+                                          # model); lbfgs, admm: "poisson"
+    penalty: str = "good"                 # "good" (Good's roughness; map, lbfgs), "hessian"
+                                          # (Frobenius norm of the Hessian: keeps edges and fine
+                                          # lines) or "tv" (total variation; lbfgs, admm)
     background: Optional[float] = None    # camera offset + dark counts; None: estimated
     tile: int = 512                       # planes wider than this are split into tiles; a
                                           # 64-plane tile then needs about 3 GB
@@ -110,6 +126,10 @@ class Parameters:
         _check(self.method in METHODS, f"method must be one of {METHODS}")
         _check(self.loss in LOSSES, f"loss must be one of {LOSSES}")
         _check(self.penalty in PENALTIES, f"penalty must be one of {PENALTIES}")
+        losses, penalties = SUPPORTED[self.method]
+        _check(self.loss in losses, f"method {self.method} takes the loss {' or '.join(losses)}")
+        _check(self.penalty in penalties,
+               f"method {self.method} takes the penalty {' or '.join(penalties)}")
         self.iterations, self.tile = int(self.iterations), int(self.tile)
         self.regularization = float(self.regularization)
         for name, (lo, hi) in LIMITS.items():
@@ -393,7 +413,8 @@ def _centre(big, small):
 
 
 def _setup(measured, psf, padding):
-    """Data on the padded grid (border = -1), its mask, and conv(a, adjoint) with the PSF."""
+    """Data on the padded grid (border = -1), its mask, and conv(a, adjoint) with the PSF;
+    conv.otf is the PSF's rfft."""
     g = np.asarray(measured, np.float32)
     big = _padded_shape(g.shape, padding)
     data = np.full(big, -1, np.float32)
@@ -405,6 +426,7 @@ def _setup(measured, psf, padding):
     def conv(a, adjoint=False):
         return fft.irfftn(fft.rfftn(a, workers=WORKERS) * (np.conj(otf) if adjoint else otf),
                           s=big, workers=WORKERS)
+    conv.otf = otf
     return g, data, data >= 0, conv
 
 
@@ -683,6 +705,304 @@ def map_lean(measured, psf, gamma=0.0, iterations=60, background=0.0, padding=(0
     return (x * x)[centre]
 
 
+# --- DeconvOptim's deconvolution(): total variation, L-BFGS, ADMM ------------------------------
+
+def _dot(a, b):
+    return float(np.vdot(a, b))
+
+
+def _tv(f, weights=(1, 1, 1), epsilon=1e-8, central=False, gradient=False):
+    """DeconvOptim's TV() (src/regularizer.jl): the sum, over the voxels where every difference
+    exists, of sqrt(epsilon + sum_d w_d (f[i + e_d] - f[i])**2); ``central``: f[i + e_d] -
+    f[i - e_d]. Axes of length 1 are left out (Julia's plane guard). ``gradient``: (value, d/df).
+    """
+    axes = [a for a, n in enumerate(f.shape) if n > 1]
+    lo = int(central)
+    core = [slice(lo, n - 1) if a in axes else slice(None) for a, n in enumerate(f.shape)]
+
+    def ends(a):            # the core shifted to i + e_a and to i - lo * e_a
+        return (tuple(slice(lo + 1, None) if k == a else s for k, s in enumerate(core)),
+                tuple(slice(0, f.shape[a] - 1 - lo) if k == a else s for k, s in enumerate(core)))
+    r = np.full(f[tuple(core)].shape, epsilon, f.dtype)
+    for a in axes:
+        hi, lo_ = ends(a)
+        d = f[hi] - f[lo_]
+        r += np.float32(weights[a]) * d * d
+    r = np.sqrt(r, out=r)
+    value = float(np.sum(r, dtype=np.float64))
+    if not gradient:
+        return value
+    g = np.zeros_like(f)
+    for a in axes:
+        hi, lo_ = ends(a)
+        q = np.float32(weights[a]) * (f[hi] - f[lo_]) / r
+        g[hi] += q
+        g[lo_] -= q
+    return value, g
+
+
+def _penalty(name, x, weights, epsilon, gradient=False, central=False):
+    """A penalty of the object x**2, as a function of x: "tv" (_tv), "hessian" (sum
+    sqrt(epsilon + ||Hessian||_F**2)) or "good" (map_lean's 4 sum (x[n+1] - x[n])**2).
+    ``gradient``: (value, d/dx)."""
+    if name == "good":
+        value = _good(x, weights)
+        return (value, -8 * _laplacian(x, weights)) if gradient else value
+    f = x * x
+    if name == "tv":
+        out = _tv(f, weights, epsilon, central, gradient)
+    else:
+        pairs, entries = _hessian_pairs(f.shape, weights), []
+        r = _hessian_norm(f, pairs, np.float32(epsilon), entries if gradient else None)
+        value = float(np.sum(r, dtype=np.float64))
+        out = (value, _hessian_gradient(r, entries, pairs)) if gradient else value
+    return (out[0], 2 * x * out[1]) if gradient else out
+
+
+def _backtracking(phi, phi_0, dphi_0, alpha=1.0, c_1=1e-4, rho_hi=0.5, rho_lo=0.1,
+                  iterations=1000):
+    """LineSearches.jl's BackTracking(order=3): alpha shrinks by quadratic, then cubic
+    interpolation until phi(alpha) <= phi_0 + c_1 alpha dphi_0. (alpha, phi(alpha)), or None where
+    Julia throws a LineSearchException."""
+    if not (math.isfinite(phi_0) and math.isfinite(dphi_0)) or dphi_0 > 0:
+        return None
+    a_1 = a_2 = np.float64(alpha)
+    phi_x0, phi_x1 = phi_0, phi(a_2)
+    for _ in range(52):                     # halve until the value is finite
+        if math.isfinite(phi_x1):
+            break
+        a_2 /= 2
+        phi_x1 = phi(a_2)
+    iteration = 0
+    with np.errstate(divide="ignore", invalid="ignore"):     # NaN and Inf as in Julia
+        while math.isfinite(phi_x1) and phi_x1 > phi_0 + c_1 * a_2 * dphi_0:
+            iteration += 1
+            if iteration > iterations:
+                return None
+            if iteration == 1:              # quadratic through phi(0), phi'(0), phi(a_2)
+                a_tmp = -(dphi_0 * a_2 ** 2) / (2 * (phi_x1 - phi_0 - dphi_0 * a_2))
+            else:                           # cubic, also through phi(a_1)
+                u, v = phi_x1 - phi_0 - dphi_0 * a_2, phi_x0 - phi_0 - dphi_0 * a_1
+                div = 1 / (a_1 ** 2 * a_2 ** 2 * (a_2 - a_1))
+                a = (a_1 ** 2 * u - a_2 ** 2 * v) * div
+                b = (-a_1 ** 3 * u + a_2 ** 3 * v) * div
+                a_tmp = (-dphi_0 / (2 * b) if a == 0
+                         else -dphi_0 / (b + np.sqrt(max(b * b - 3 * a * dphi_0, 0))))
+            a_1, a_2 = a_2, np.fmax(np.fmin(a_tmp, a_2 * rho_hi), a_2 * rho_lo)
+            phi_x0, phi_x1 = phi_x1, phi(a_2)
+            while not math.isfinite(phi_x1) and iteration < iterations:
+                iteration += 1
+                a_2 /= 2
+                phi_x1 = phi(a_2)
+    return (float(a_2), phi_x1) if math.isfinite(phi_x1) else None
+
+
+def _twoloop(grad, dxs, dgs, rhos, pseudo):
+    """Optim's twoloop!: the L-BFGS direction -H grad from the last steps dx and gradient changes
+    dg (slot (i - 1) % m holds step i); H0 = 1, or dx'dg / dg'dg of the last pair."""
+    m = len(rhos)
+    used = [(i - 1) % m for i in range(max(1, pseudo - m), pseudo)]      # oldest first
+    q, alphas = grad.copy(), {}
+    for k in reversed(used):
+        alphas[k] = rhos[k] * _dot(dxs[k], q)
+        q -= np.float32(alphas[k]) * dgs[k]
+    if pseudo > 1:
+        k = (pseudo - 2) % m
+        q *= np.float32(_dot(dxs[k], dgs[k]) / _dot(dgs[k], dgs[k]))
+    for k in used:
+        q += np.float32(alphas[k] - rhos[k] * _dot(dgs[k], q)) * dxs[k]
+    q *= -1
+    return q
+
+
+def lbfgs(measured, psf, gamma=0.05, iterations=20, background=0.0, padding=(0, 0, 0),
+          weights=(1, 1, 1), penalty="tv", epsilon=1e-8, central=False, memory=10,
+          callback=None):
+    """DeconvOptim's default deconvolution() (src/deconvolution.jl and generic_invert.jl):
+    Poisson loss + gamma * penalty of the object x**2 (Non_negative), from x = 1, minimised by
+    Optim's LBFGS(m=10) with LineSearches' BackTracking (order 3, first step 1).
+
+    The data are divided by their mean (normalize_data) and the background with them, so gamma
+    is Julia's lambda; as the Poisson loss and the penalties scale linearly with the counts, it
+    weighs the penalty as map_lean's gamma in counts does. penalty: see _penalty; epsilon is the
+    constant under its square root (TV() and TH() in Julia: 1f-8). callback(iteration, object)
+    may return True to stop early.
+    """
+    g, data, mask, conv = _setup(measured, psf, padding)
+    scale = max(float(g.mean()), 1e-7)
+    data /= np.float32(scale)
+    value, residual, _ = _poisson(data, mask, np.float32(background / scale))
+    centre = _centre(data.shape, g.shape)
+
+    def fg(x, gradient=True):               # total_loss of generic_invert.jl, its gradient in x
+        mu = conv(x * x)
+        if not gradient:
+            return value(mu) + gamma * _penalty(penalty, x, weights, epsilon, False, central)
+        pen, dpen = _penalty(penalty, x, weights, epsilon, True, central)
+        grad = 2 * x * conv(residual(mu), True)
+        grad += np.float32(gamma) * dpen
+        return value(mu) + gamma * pen, grad
+
+    def phi(alpha):                         # the objective along the search direction s
+        np.add(x, np.float32(alpha) * s, out=x_ls)
+        return fg(x_ls, False)
+
+    x, x_ls = np.ones(data.shape, np.float32), np.empty(data.shape, np.float32)
+    f, grad = fg(x)
+    dxs, dgs, rhos = [None] * memory, [None] * memory, [0.0] * memory
+    pseudo = 0
+    for it in range(1, iterations + 1):
+        pseudo += 1
+        s = _twoloop(grad, dxs, dgs, rhos, pseudo)
+        if _dot(grad, s) >= 0:              # not a descent direction: reset_search_direction!
+            pseudo, s = 1, -grad
+        found = _backtracking(phi, f, _dot(grad, s))
+        if found is None:                   # perform_linesearch!: reset and try once more
+            pseudo, s = 1, -grad
+            found = _backtracking(phi, f, _dot(grad, s))
+        if found is None:
+            break
+        f_new, g_new = fg(x_ls)             # finite: the line search found it so
+        dx, dg = x_ls - x, g_new - grad     # accept_step!
+        x, x_ls, f, grad = x_ls, x, f_new, g_new
+        curvature = _dot(dx, dg)
+        if curvature == 0:                  # 1 / dot is Inf: forget the history
+            pseudo = 0
+        else:
+            k = (pseudo - 1) % memory
+            dxs[k], dgs[k], rhos[k] = dx, dg, 1 / curvature
+        if callback is not None and callback(it, np.square(x[centre]) * np.float32(scale)):
+            break
+    return np.square(x[centre]) * np.float32(scale)
+
+
+def _stencil(st, x, adjoint=False):
+    """admm.jl's Stencil: (S x)[i] = sum c x[i + o] over st = [(o, c), ..], periodic; the
+    adjoint takes x[i - o]."""
+    out = np.zeros_like(x)
+    for offset, c in st:
+        out += np.float32(c) * np.roll(x, [o if adjoint else -o for o in offset],
+                                       tuple(range(x.ndim)))
+    return out
+
+
+def _admm_stencils(penalty, shape, weights, central=False):
+    """admm_reg: the stencils K_k whose group norm sqrt(sum_k (K_k x)**2) is the penalty. "tv":
+    forward (central) differences times sqrt(w); "hessian" (Julia's TH): second differences times
+    w and mixed forward differences times sqrt(2 w_a w_b)."""
+    axes = [a for a, n in enumerate(shape) if n > 1]
+    zero = (0,) * len(shape)
+
+    def e(*steps):                          # offset of (axis, step) pairs
+        return tuple(sum(s for a, s in steps if a == k) for k in range(len(shape)))
+    if penalty == "tv":
+        return [[(e((a, 1)), math.sqrt(weights[a])),
+                 (e((a, -1)) if central else zero, -math.sqrt(weights[a]))] for a in axes]
+    out = [[(e((a, 1)), weights[a]), (e((a, -1)), weights[a]), (zero, -2 * weights[a])]
+           for a in axes]
+    for i, a in enumerate(axes):
+        for b in axes[i + 1:]:
+            c = math.sqrt(2 * weights[a] * weights[b])
+            out.append([(e((a, 1), (b, 1)), c), (e((a, 1)), -c), (e((b, 1)), -c), (zero, c)])
+    return out
+
+
+def _residuals(kx, z, z_old, w):
+    """|Kx - z|**2, |z - z_old|**2, |Kx|**2, |z|**2 and |w|**2 of one split."""
+    return np.array([_dot(a, a) for a in (kx - z, z - z_old, kx, z, w)])
+
+
+def admm(measured, psf, gamma=0.05, iterations=100, background=0.0, padding=(0, 0, 0),  # noqa: C901
+         weights=(1, 1, 1), penalty="tv", epsilon=1e-8, central=False, rho=None,
+         adaptive_rho=True, check_every=10, rho_balance=10.0, rho_factor=2.0, callback=None):
+    # one function, as admm_deconvolution in admm.jl, so the two can be read side by side
+    """DeconvOptim's ADMM (src/admm.jl): Poisson loss + gamma * penalty, x >= 0, no derivatives.
+
+    Splits z1 = h * x (Poisson prox per voxel; free in the padding border, Almeida-Figueiredo),
+    z_k = K_k x (the penalty's differences, _admm_stencils, periodic; group shrinkage with a
+    Huber threshold sqrt(epsilon)) and z3 = x (projection on x >= 0); the x-update is one division
+    in Fourier space. Data normalised to mean 1 as in lbfgs, gamma is Julia's lambda. rho
+    defaults to 0.1 / mean; every ``check_every`` iterations it doubles (halves) when the primal
+    residual exceeds the dual one by ``rho_balance`` (or the reverse). Returns z3.
+    callback(iteration, object) may return True to stop early.
+    """
+    g, y, mask, conv = _setup(measured, psf, padding)
+    scale = max(float(g.mean()), 1e-7)
+    y = np.maximum(y, 0) / np.float32(scale)          # zero in the border, as Julia's y
+    bg, shape, otf = np.float32(background / scale), y.shape, conv.otf
+    centre = _centre(shape, g.shape)
+    stencils = _admm_stencils(penalty, shape, weights, central)
+    delta = np.zeros(shape, np.float32)
+    delta[(0,) * len(shape)] = 1
+    denom = np.abs(otf) ** 2 + np.float32(1)          # H'H + sum K'K + I in Fourier space
+    for st in stencils:
+        denom += np.abs(fft.rfftn(_stencil(st, delta), workers=WORKERS)) ** 2
+    del delta
+    rho = 0.1 / float(y[centre].mean()) if rho is None else rho      # default_ρ(PoissonProx)
+    thr = np.float32(math.sqrt(epsilon))
+    x = np.ones(shape, np.float32)
+    z1, w1 = conv(x), np.zeros_like(x)
+    zs, ws = [_stencil(st, x) for st in stencils], [np.zeros_like(x) for _ in stencils]
+    z3, w3 = np.maximum(x, 0), np.zeros_like(x)
+    for it in range(1, iterations + 1):
+        check = it % check_every == 0
+        # x-update: x = (H'H + sum K'K + I)^-1 [H'(z1 - w1) + sum K'(z - w) + (z3 - w3)]
+        r = z3 - w3
+        for st, z, w in zip(stencils, zs, ws):
+            r += _stencil(st, z - w, adjoint=True)
+        spectrum = fft.rfftn(z1 - w1, workers=WORKERS) * np.conj(otf)
+        spectrum += fft.rfftn(r, workers=WORKERS)
+        spectrum /= denom
+        del r
+        hx = fft.irfftn(otf * spectrum, s=shape, workers=WORKERS)
+        x = fft.irfftn(spectrum, s=shape, workers=WORKERS)
+        del spectrum
+        # z/w-updates; at a check also the primal |Kx - z| and dual |z - z_old| residuals
+        res = np.zeros(5)
+        rho32 = np.float32(rho)
+        t = hx + w1             # data: argmin_u f(u + bg) + rho/2 (u - t)**2, f(mu) = mu - y log mu
+        a = rho32 * (t + bg) - 1
+        z = np.where(mask, (a + np.sqrt(a * a + 4 * rho32 * y)) / (2 * rho32) - bg, t)
+        w1 = t - z
+        if check:
+            res += _residuals(hx, z, z1, w1)
+        z1 = z
+        del a, t, hx
+        for st, w in zip(stencils, ws):     # penalty: w holds v = Kx + w during the prox
+            w += _stencil(st, x)
+        norm = np.sqrt(sum(w * w for w in ws))
+        kappa = np.float32(gamma / rho)
+        shrink = np.where(norm > thr + kappa, 1 - kappa / np.maximum(norm, thr + kappa),
+                          thr / (thr + kappa))
+        del norm
+        for k, (st, w) in enumerate(zip(stencils, ws)):
+            z = shrink * w
+            w -= z
+            if check:
+                res += _residuals(_stencil(st, x), z, zs[k], w)
+            zs[k] = z
+        del shrink
+        t = x + w3                          # positivity: projection on x >= 0
+        z = np.maximum(t, 0)
+        w3 = t - z
+        if check:
+            res += _residuals(x, z, z3, w3)
+        z3 = z
+        del t, z
+        if callback is not None and callback(it, z3[centre] * np.float32(scale)):
+            break
+        if check and adaptive_rho:          # residual balancing (Boyd et al. 2011, 3.4.1)
+            r_rel = math.sqrt(res[0]) / max(math.sqrt(res[2]), math.sqrt(res[3]), 2.2e-16)
+            s_rel = math.sqrt(res[1]) / max(math.sqrt(res[4]), 2.2e-16)
+            fac = (rho_factor if r_rel > rho_balance * s_rel
+                   else 1 / rho_factor if s_rel > rho_balance * r_rel else 1.0)
+            if fac != 1.0:
+                rho *= fac
+                for w in (w1, w3, *ws):
+                    w /= np.float32(fac)
+    return z3[centre] * np.float32(scale)
+
+
 # --- the recipe -------------------------------------------------------------------------------
 
 def memory_bytes(shape, optics: Optics, parameters: Optional[Parameters] = None, itemsize=2,
@@ -694,7 +1014,7 @@ def memory_bytes(shape, optics: Optics, parameters: Optional[Parameters] = None,
     margin = overlap_px(optics, nz, measured)
     ys, xs = _tiles(ny, p.tile, margin), _tiles(nx, p.tile, margin)
     tile = _padded_shape((nz, ys[0][1] - ys[0][0], xs[0][1] - xs[0][0]), PADDING)
-    kind = p.method if p.method == "rl" or p.penalty != "hessian" else "hessian"
+    kind = p.method + ("_hessian" if p.penalty == "hessian" and p.method != "rl" else "")
     return nz * ny * nx * (itemsize + 8) + math.prod(tile) * TILE_BYTES[kind]
 
 
@@ -730,9 +1050,13 @@ def deconvolve(stack, optics: Optics, parameters: Optional[Parameters] = None, p
         window = data[:, y0:y1, x0:x1]
         if p.method == "rl":
             result = richardson_lucy(window, kernel, p.iterations, background, PADDING, step)
-        else:
+        elif p.method == "map":
             result = map_lean(window, kernel, gamma, p.iterations, background, PADDING,
                               callback=step, loss=p.loss, penalty=p.penalty)
+        else:       # Poisson only: gamma = regularization = DeconvOptim's lambda
+            result = (lbfgs if p.method == "lbfgs" else admm)(
+                window, kernel, gamma, p.iterations, background, PADDING, penalty=p.penalty,
+                callback=step)
         out[:, cy0:cy1, cx0:cx1] = result[:, cy0 - y0:cy1 - y0, cx0 - x0:cx1 - x0]
     return out[0] if plane else out
 

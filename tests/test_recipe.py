@@ -1,10 +1,11 @@
 """The deconvolution recipe: same result as DeconvOptim.jl, tiles, PSF from the optics, refusals.
 
 deconvolution_julia_reference.npz holds the z and y maximum projections (scaled to 1, float16) of
-DeconvOptim.jl's map_cj_lean (branch new_methods, c72a2c8) on synthetic((32, 256, 256), FRAME)
-with gamma 1e-4, 30 iterations, background 5 and z padding 0.25: mip_z / mip_y with the default
-Poisson loss and Good's roughness, <case>_mip_z / <case>_mip_y for the cases of
-benchmark/benchmark.jl (solvers map_lean_<case>).
+DeconvOptim.jl (branch new_methods, c72a2c8) on synthetic((32, 256, 256), FRAME) with background 5
+and z padding 0.25: mip_z / mip_y of map_cj_lean with gamma 1e-4, 30 iterations, the default
+Poisson loss and Good's roughness; <case>_mip_z / <case>_mip_y for the cases of
+benchmark/benchmark.jl: map_lean_<case> for anscombe, gauss and hessian, and the
+solvers lbfgs_tv, admm_tv (deconvolution() with TV, lambda 0.01) and admm_th (TH, lambda 0.1).
 """
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -51,6 +52,37 @@ def test_other_losses_and_the_hessian_penalty_match_deconvoptim_jl(case, setting
     assert ncc(result.max(0), julia["mip_z"].astype(np.float32)) < 0.995
 
 
+@pytest.mark.parametrize("case, settings", [
+    ("lbfgs_tv", {"method": "lbfgs", "penalty": "tv", "iterations": 20}),
+    ("admm_tv", {"method": "admm", "penalty": "tv", "iterations": 50}),
+    ("admm_th", {"method": "admm", "penalty": "hessian", "iterations": 50,
+                 "regularization": 0.1}),       # at 0.01 TV and TH still look alike (0.998)
+])
+def test_lbfgs_and_admm_match_deconvoptim_jl(case, settings):
+    _, measured = d.synthetic((32, 256, 256), FRAME)
+    p = d.Parameters(**{"regularization": 0.01, "background": 5.0, **settings})
+    result = d.deconvolve(measured, FRAME, p)
+    julia = np.load(REFERENCE)
+    # 1.0 for all three: Optim's line search and admm.jl's steps, ported as they are
+    assert ncc(result.max(0), julia[f"{case}_mip_z"].astype(np.float32)) > 0.99
+    assert ncc(result.max(1), julia[f"{case}_mip_y"].astype(np.float32)) > 0.99
+    others = [k for k in julia if k.endswith("mip_z") and k != f"{case}_mip_z"]
+    assert max(ncc(result.max(0), julia[k].astype(np.float32)) for k in others) < 0.995
+
+
+def test_tv_and_the_lbfgs_penalties():
+    # DeconvOptim's docstring: TV(num_dims=2, weights=[1, 1])([1 2 3; 4 5 6; 7 8 9]) == 12.649111
+    assert np.isclose(d._tv(np.arange(1, 10, dtype=np.float32).reshape(3, 3), (1, 1)), 12.649111)
+    rng = np.random.default_rng(0)
+    x, weights, step = rng.random((5, 7, 6)), (1, 2, 0.5), 1e-6
+    for name, central in (("tv", False), ("tv", True), ("good", False), ("hessian", False)):
+        value = lambda x: d._penalty(name, x, weights, 1e-8, central=central)     # noqa: E731
+        numeric = np.array([(value(x + step * u) - value(x - step * u)) / (2 * step)
+                            for u in np.eye(x.size).reshape((x.size,) + x.shape)]).reshape(x.shape)
+        np.testing.assert_allclose(d._penalty(name, x, weights, 1e-8, True, central)[1], numeric,
+                                   atol=1e-6)
+
+
 def test_hessian_gradient_and_curvature():
     rng = np.random.default_rng(0)
     f, e = rng.random((5, 7, 6)), rng.random((5, 7, 6))
@@ -71,11 +103,17 @@ def test_hessian_gradient_and_curvature():
                       (value(f + t * e) - 2 * value(f) + value(f - t * e)) / t ** 2, rtol=1e-5)
 
 
-@pytest.mark.parametrize("settings", [{"method": "rl"}, {}, {"penalty": "hessian"}])
+@pytest.mark.parametrize("settings", [
+    {"method": "rl"}, {}, {"penalty": "hessian"},
+    {"method": "lbfgs", "penalty": "tv", "iterations": 12},     # the whole history: 10 steps
+    {"method": "lbfgs", "penalty": "hessian", "iterations": 12},
+    {"method": "admm", "penalty": "tv", "iterations": 10},      # with a residual check
+    {"method": "admm", "penalty": "hessian", "iterations": 10},
+])
 def test_memory_estimate_covers_the_peak(settings):
     import tracemalloc
     measured = d.synthetic((12, 160, 96), FRAME)[1].astype(np.uint16)
-    p = d.Parameters(iterations=3, background=5.0, tile=64, **settings)   # several tiles
+    p = d.Parameters(**{"iterations": 3, "background": 5.0, "tile": 64, **settings})  # 6 tiles
     tracemalloc.start()
     try:
         d.deconvolve(measured, FRAME, p)
@@ -186,8 +224,12 @@ def test_plane_cancel_and_refusals():
     for bad in ({"optics": {"pixel_um": 0.12, "na": 1.1}},                    # NA above air
                 {"optics": {"pixel_um": 0.12, "colour": 1}},                  # unknown field
                 {"optics": {"pixel_um": 0.12}, "parameters": {"iterations": 0}},
-                {"optics": {"pixel_um": 0.12}, "parameters": {"method": "magic"}}):
+                {"optics": {"pixel_um": 0.12}, "parameters": {"method": "magic"}},
+                {"optics": {"pixel_um": 0.12}, "parameters": {"method": "map", "penalty": "tv"}},
+                {"optics": {"pixel_um": 0.12}, "parameters": {"method": "lbfgs", "loss": "gauss"}}):
         with pytest.raises(ValueError):
             d.run(measured, bad)
+    with pytest.raises(ValueError, match="method admm takes the penalty tv or hessian"):
+        d.Parameters(method="admm")                         # Good's roughness is the default
     with pytest.raises(ValueError):
         d.deconvolve(np.full((4, 8, 8), np.nan), FRAME)

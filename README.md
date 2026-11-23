@@ -22,9 +22,19 @@ result = deconvolve(stack, optics, Parameters(method="map", iterations=30))  # (
 - **PSF models** (`Optics.psf_model`): `scalar` (the pupil propagated plane by plane),
   `vectorial` (Richards–Wolf), `gaussian` (widths from the optics or given), `measured` (an array
   such as `distill_psf` makes from a bead stack, resampled to the data's voxels).
-- **Solvers** (`Parameters.method`): `rl` (Richardson–Lucy) and `map`, a port of DeconvOptim's
-  `map_cj_lean` (conjugate gradients, object = x², Poisson, Anscombe or Gauss noise, Good's roughness
-  or Hessian penalty).
+- **Solvers** (`Parameters.method`), each checked against DeconvOptim.jl on the same stack
+  (correlation of the maximum projections; tests/test_recipe.py):
+
+  | method | DeconvOptim.jl | noise model | penalty | match |
+  |---|---|---|---|---|
+  | `rl` | `richardson_lucy_iterative` | Poisson | none | |
+  | `map` | `map_cj_lean`: conjugate gradients, object = x² | Poisson, Anscombe, Gauss | Good's roughness, Hessian | 0.995 to 1.000 |
+  | `lbfgs` | `deconvolution()`: L-BFGS (Optim.jl), object = x² | Poisson | total variation, Good's, Hessian | 1.000 |
+  | `admm` | `deconvolution(opt=ADMM())` | Poisson | total variation, Hessian | 1.000 |
+
+  `map` needs the least memory, `lbfgs` with total variation gives the best result per iteration
+  on the test object, `admm` converges slowly on sparse objects (correlation 0.5 after 200
+  iterations, against 0.98 for `lbfgs` after 60).
 - **Tiles**: planes wider than `Parameters.tile` (512) are deconvolved in tiles that overlap by
   the PSF's reach, so a full sensor fits in a few GB. `memory_bytes()` estimates a run's peak.
 - **Worker** (`uc2deconvolution.worker`): ImSwitch pushes a volume's planes in one POST (a JSON

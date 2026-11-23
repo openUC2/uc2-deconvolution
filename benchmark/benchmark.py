@@ -27,7 +27,8 @@ GAMMA = 1e-4                                # Good's roughness weight (counts); 
 ITER = 30
 SOLVERS = {"py_rl": "Richardson-Lucy, numpy", "jl_rl": "Richardson-Lucy, Julia",
            "py_map_lean": "map_lean, numpy port", "jl_map_lean": "map_cj_lean, Julia",
-           "jl_admm_tv": "ADMM + TV (50 it.), Julia", "jl_lbfgs_tv": "L-BFGS + TV (20 it.), Julia"}
+           "py_admm_tv": "ADMM + TV (50 it.), numpy port", "jl_admm_tv": "ADMM + TV (50 it.), Julia",
+           "py_lbfgs_tv": "L-BFGS + TV (20 it.), numpy port", "jl_lbfgs_tv": "L-BFGS + TV (20 it.), Julia"}
 
 
 def tag(shape):
@@ -72,6 +73,9 @@ def cmd_run(out, shape):
     solvers = {
         "py_rl": lambda cb=None: dn.richardson_lucy(measured, psf, iterations=ITER, background=BACKGROUND, padding=PADDING, callback=cb),
         "py_map_lean": lambda cb=None: dn.map_lean(measured, psf, gamma=GAMMA, iterations=ITER, background=BACKGROUND, padding=PADDING, callback=cb),
+        # benchmark.jl's admm_tv and lbfgs_tv: lambda 0.01
+        "py_admm_tv": lambda cb=None: dn.admm(measured, psf, 0.01, 50, BACKGROUND, PADDING, callback=cb),
+        "py_lbfgs_tv": lambda cb=None: dn.lbfgs(measured, psf, 0.01, 20, BACKGROUND, PADDING, callback=cb),
     }
     for name, solve in solvers.items():
         t0 = time.perf_counter()
@@ -103,9 +107,10 @@ def cmd_table(out):
         truth = load(out, "truth", shape)
         q = {k: round(ncc(load(out, k, shape), truth), 3) for k in SOLVERS if (out / f"{s}_{k}.f32").exists()}
         line = f"{s}: measured {get[(s, 'py_rl')]['ncc_measured']} {q}"
-        if (out / f"{s}_jl_map_lean.f32").exists():
-            py, jl = load(out, "py_map_lean", shape), load(out, "jl_map_lean", shape)
-            line += f" | port vs Julia: correlation {ncc(py, jl):.4f}"
+        for name in ("map_lean", "admm_tv", "lbfgs_tv"):
+            if (out / f"{s}_jl_{name}.f32").exists() and (out / f"{s}_py_{name}.f32").exists():
+                py, jl = load(out, f"py_{name}", shape), load(out, f"jl_{name}", shape)
+                line += f" | {name} port vs Julia: correlation {ncc(py, jl):.4f}"
         print(line)
 
 
@@ -185,7 +190,7 @@ def cmd_figures(out, figdir):
     fig.savefig(figdir / "deconvolution_benchmark.png", dpi=170)
     plt.close(fig)
 
-    # 4. convergence of the two numpy solvers
+    # 4. convergence of the numpy solvers
     curves = [r for r in get.values() if "curve" in r]
     fig, ax = plt.subplots(figsize=(4.6, 3.2))
     for r in curves:
