@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "uc2-deconvolution"
+version = "0.1.0"
+description = "3D deconvolution for microscopy in numpy: PSF models, PSFs from beads, DeconvOptim.jl's solvers, and an HTTP worker"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "openUC2" }]
+keywords = ["deconvolution", "microscopy", "point spread function", "richardson-lucy", "openUC2"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = ["numpy>=1.26", "scipy>=1.11"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+uc2-deconvolution-worker = "uc2deconvolution.worker:main"
+
+[project.urls]
+Homepage = "https://github.com/openUC2/uc2-deconvolution"
+Issues = "https://github.com/openUC2/uc2-deconvolution/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/uc2deconvolution"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["benchmark"]  # scripts for the comparison with Julia
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "C90"]
