@@ -48,7 +48,17 @@ uc2-deconvolution-worker --port 8090
 docker run --rm -p 8090:8090 ghcr.io/openuc2/uc2-deconvolution
 ```
 
-Then in ImSwitch: OME-Zarr viewer, Deconvolve, worker URL `http://<this computer>:8090`.
+Then in ImSwitch: OME-Zarr viewer, Deconvolve, worker URL `http://<this computer>:8090`. On the
+openUC2 Raspberry Pi OS ([os-rpi](https://github.com/openUC2/os-rpi)) the same image runs beside
+ImSwitch (the imswitch deployment's `processing-worker` feature), and ImSwitch finds it without
+settings. A job that would not fit in the free memory is refused with 409 before it starts.
+
+## Releases
+
+GitHub Actions test every push on x86 and arm64 (`test.yml`) and build the worker image for
+amd64 and arm64 (`image.yml`): `ghcr.io/openuc2/uc2-deconvolution:sha-<commit>` from main, which
+os-rpi pins by digest, and `:<version>` from a `v*` tag. `release.yml` publishes a tag to PyPI
+once a trusted publisher is set up there and the repository variable `PYPI_PUBLISH` is `true`.
 
 ## Tests and benchmark
 

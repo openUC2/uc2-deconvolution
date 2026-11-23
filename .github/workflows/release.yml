@@ -1,0 +1,21 @@
+name: release
+
+# Publishes a v* tag to PyPI. Off until set up: add a trusted publisher on pypi.org (project
+# uc2-deconvolution, this repository, workflow release.yml, environment pypi), then set the
+# repository variable PYPI_PUBLISH to true.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  pypi:
+    if: vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1
