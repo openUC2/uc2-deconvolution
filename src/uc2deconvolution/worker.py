@@ -13,6 +13,9 @@ until it is deleted, at most an hour after the job ended.
     DELETE /jobs/<id>          -> stops a queued or running job and forgets it
     GET    /                   -> {"worker": "imswitch-processing", "recipes": {name: version}}
 
+A job that would need more memory than the machine has free (the recipe's ``memory``) is refused
+with 409 before it is queued: on the microscope's own computer it must not run the memory out.
+
 ``spec`` is what the recipe's ``run`` takes ({"optics": .., "parameters": ..} for deconvolution,
 plus a measured PSF); it travels in the body because it can hold an array.
 numpy and the recipe's own imports only. ``run_remote`` is the client.
@@ -38,6 +41,26 @@ RECIPES = {deconvolution.NAME: deconvolution}
 KEEP_S = 3600  # finished jobs are forgotten after an hour
 MAX_BYTES = 16 << 30  # one volume
 MAX_SPEC = 64 << 20  # the JSON spec, a measured PSF included
+
+
+def _free_bytes():
+    """Memory a new job can get: MemAvailable, within a container's own limit (cgroup v2); None
+    where /proc/meminfo is missing (macOS, Windows)."""
+    try:
+        with open("/proc/meminfo") as f:
+            free = next(int(line.split()[1]) * 1024 for line in f
+                        if line.startswith("MemAvailable:"))
+    except (OSError, StopIteration, ValueError):
+        return None
+    try:
+        with open("/sys/fs/cgroup/memory.max") as f:
+            limit = f.read().strip()
+        if limit != "max":
+            with open("/sys/fs/cgroup/memory.current") as f:
+                free = min(free, int(limit) - int(f.read()))
+    except (OSError, ValueError):
+        pass
+    return free
 
 
 class Worker:
@@ -188,6 +211,12 @@ class Handler(BaseHTTPRequestHandler):
             spec = json.loads(self.rfile.read(read) or b"{}")
             if not isinstance(spec, dict):
                 raise ValueError("the spec is not a JSON object")
+            need, free = RECIPES[recipe].memory(shape, dtype.itemsize, spec), _free_bytes()
+            if free is not None and need > free:
+                self._drain(read)
+                return self._reply(409, {"error": (
+                    f"this job needs about {need / 2**30:.1f} GB of memory and the worker has "
+                    f"{free / 2**30:.1f} GB free: use smaller tiles or a bigger machine")})
         except (KeyError, ValueError, TypeError) as e:
             self._drain(read)
             return self._reply(400, {"error": str(e)})

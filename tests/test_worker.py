@@ -27,6 +27,14 @@ def test_a_job_gives_the_local_result(worker_url):
     assert worker.info(worker_url)["recipes"] == {recipe.NAME: recipe.VERSION}
 
 
+def test_a_job_that_does_not_fit_is_refused(worker_url, monkeypatch):
+    monkeypatch.setattr(worker, "_free_bytes", lambda: 1 << 20)
+    volume = np.ones((4, 64, 64), np.uint16)
+    with pytest.raises(RuntimeError, match="409.*memory"):
+        list(worker.run_remote(worker_url, volume, volume.shape, volume.dtype, SPEC))
+    assert worker.info(worker_url)["jobs"] == 0
+
+
 def test_worker_reports_failures_and_cancels(worker_url):
     volume = np.ones((4, 32, 32), np.uint16)
     bad = {"optics": {"pixel_um": 0.12, "na": 1.1}}

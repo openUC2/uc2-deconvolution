@@ -1069,6 +1069,14 @@ def run(stack, spec: dict, progress=None) -> np.ndarray:
                       parse(Parameters, spec.get("parameters")), progress, measured)
 
 
+def memory(shape, itemsize: int, spec: dict) -> int:
+    """About the peak memory of run() on a stack of this shape: what a runner checks first."""
+    measured = decode_psf(spec["psf"]) if spec.get("psf") else None
+    shape = tuple(shape) if len(shape) == 3 else (1,) + tuple(shape)
+    return memory_bytes(shape, parse(Optics, spec.get("optics")),
+                        parse(Parameters, spec.get("parameters")), itemsize, measured)
+
+
 # --- test data --------------------------------------------------------------------------------
 
 def synthetic(shape, optics: Optics, seed=1, photons=300.0, background=5.0):
